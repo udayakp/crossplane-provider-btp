@@ -64,6 +64,20 @@ type ServiceInstanceParameters struct {
 	// Selector for a Subaccount in account to populate subaccountId.
 	// +kubebuilder:validation:Optional
 	SubaccountSelector *xpv1.Selector `json:"subaccountSelector,omitempty" tf:"-"`
+
+	// Timeout for create, update, and delete operations, e.g. "60m".
+	// Applied to all three operations. If unset, the terraform-provider-btp default applies.
+	// +kubebuilder:validation:Optional
+	OperationTimeout *string `json:"operationTimeout,omitempty"`
+
+	// When true, Observe() will query the BTP Service Manager by name to resolve the instance
+	// GUID if the external-name annotation is not yet set and a Conflict condition is present.
+	// This enables automatic recovery from a Terraform timeout during initial provisioning,
+	// and also allows adopting pre-existing BTP instances without manually looking up the GUID.
+	// When false (default), the controller stays in the Conflict error loop and requires the
+	// user to manually set crossplane.io/external-name to the BTP instance GUID.
+	// +kubebuilder:validation:Optional
+	AdoptIfExists *bool `json:"adoptIfExists,omitempty"`
 }
 
 // ServiceInstanceObservation are the observable fields of a ServiceInstance.
