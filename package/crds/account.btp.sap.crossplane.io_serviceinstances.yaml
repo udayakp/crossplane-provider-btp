@@ -83,6 +83,15 @@ spec:
                 description: ServiceInstanceParameters are the configurable fields
                   of a ServiceInstance.
                 properties:
+                  adoptIfExists:
+                    description: |-
+                      When true, Observe() will query the BTP Service Manager by name to resolve the instance
+                      GUID if the external-name annotation is not yet set and a Conflict condition is present.
+                      This enables automatic recovery from a Terraform timeout during initial provisioning,
+                      and also allows adopting pre-existing BTP instances without manually looking up the GUID.
+                      When false (default), the controller stays in the Conflict error loop and requires the
+                      user to manually set crossplane.io/external-name to the BTP instance GUID.
+                    type: boolean
                   name:
                     description: Name of the service instance in btp, required
                     type: string

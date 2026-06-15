@@ -22,12 +22,15 @@ import (
 
 	"github.com/sap/crossplane-provider-btp/apis/account/v1alpha1"
 	providerv1alpha1 "github.com/sap/crossplane-provider-btp/apis/v1alpha1"
+	"github.com/sap/crossplane-provider-btp/btp"
 	"github.com/sap/crossplane-provider-btp/internal"
 	siClient "github.com/sap/crossplane-provider-btp/internal/clients/account/serviceinstance"
+	smClient "github.com/sap/crossplane-provider-btp/internal/clients/servicemanager"
 	tfClient "github.com/sap/crossplane-provider-btp/internal/clients/tfclient"
 	"github.com/sap/crossplane-provider-btp/internal/controller/providerconfig"
 	"github.com/sap/crossplane-provider-btp/internal/di"
 	"github.com/sap/crossplane-provider-btp/internal/tracking"
+	controllerlog "sigs.k8s.io/controller-runtime/pkg/log"
 )
 
 const (
@@ -36,15 +39,17 @@ const (
 	errGetPC              = "cannot get ProviderConfig"
 	errGetCreds           = "cannot get credentials"
 
-	errObserveInstance = "cannot observe serviceinstance"
-	errCreateInstance  = "cannot create serviceinstance"
-	errUpdateInstance  = "cannot update serviceinstance"
-	errSaveData        = "cannot update cr data"
-	errGetInstance     = "cannot get serviceinstance"
-	errTrackRUsage     = "cannot track ResourceUsage"
-	errInitServicePlan = "while initializing service plan"
-	errConnectClient   = "while connecting to service"
-	errDeleteInstance  = "cannot delete serviceinstance"
+	errObserveInstance    = "cannot observe serviceinstance"
+	errCreateInstance     = "cannot create serviceinstance"
+	errUpdateInstance     = "cannot update serviceinstance"
+	errSaveData           = "cannot update cr data"
+	errGetInstance        = "cannot get serviceinstance"
+	errTrackRUsage        = "cannot track ResourceUsage"
+	errInitServicePlan    = "while initializing service plan"
+	errConnectClient      = "while connecting to service"
+	errDeleteInstance     = "cannot delete serviceinstance"
+	errInstanceLookup     = "SM API instance lookup by name failed"
+	errInitInstanceLookup = "cannot initialize instance lookup client"
 )
 
 var uuidRegex = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
@@ -118,13 +123,31 @@ func (c *connector) Connect(ctx context.Context, mg resource.Managed) (managed.E
 		return nil, errors.Wrap(err, errConnectClient)
 	}
 
-	return &external{tfClient: client, kube: c.kube, tracker: c.resourcetracker}, nil
+	// Build SM proxy client for adoptIfExists GUID lookups.
+	// Only initialised when adoptIfExists=true to avoid unnecessary CIS API calls on every reconcile.
+	// Failure is non-fatal — smProxy will be nil and lookupInstanceByName returns ("", false, nil).
+	var smProxy smClient.InstanceLookup
+	cr := mg.(*v1alpha1.ServiceInstance)
+	log := controllerlog.FromContext(ctx)
+	if cr.Spec.ForProvider.AdoptIfExists != nil && *cr.Spec.ForProvider.AdoptIfExists &&
+		cr.Spec.ForProvider.SubaccountID != nil {
+		btpClient, btpErr := providerconfig.CreateClient(ctx, mg, c.kube, c.usage, btp.NewBTPClient, c.resourcetracker)
+		if btpErr != nil {
+			log.Info(errInitInstanceLookup, "error", btpErr.Error())
+		} else {
+			p := smClient.NewServiceManagerInstanceProxyClient(btpClient.AccountsServiceClient)
+			smProxy = &p
+		}
+	}
+
+	return &external{tfClient: client, kube: c.kube, tracker: c.resourcetracker, smProxy: smProxy}, nil
 }
 
 type external struct {
 	tfClient tfClient.TfProxyControllerI
 	kube     client.Client
 	tracker  tracking.ReferenceResolverTracker
+	smProxy  smClient.InstanceLookup
 }
 
 // Disconnect is a no-op for the external client to close its connection.
@@ -173,6 +196,34 @@ func (e *external) Observe(ctx context.Context, mg resource.Managed) (managed.Ex
 
 	switch status {
 	case tfClient.NotExisting:
+		// adoptIfExists: when external-name is not yet a UUID and adoptIfExists=true,
+		// query SM API by name to resolve the GUID. Fires only when the async goroutine
+		// is not running (NotExisting is only returned after the goroutine ends).
+		// Handles both timeout recovery and pre-existing instance adoption.
+		if cr.Spec.ForProvider.AdoptIfExists != nil && *cr.Spec.ForProvider.AdoptIfExists &&
+			e.smProxy != nil && cr.Spec.ForProvider.SubaccountID != nil {
+			externalName := meta.GetExternalName(cr)
+			if externalName == "" || externalName == cr.Name {
+				guid, ready, lookupErr := e.smProxy.InstanceLookupBySubaccount(
+					ctx, *cr.Spec.ForProvider.SubaccountID, cr.Spec.ForProvider.Name)
+				if lookupErr != nil {
+					return managed.ExternalObservation{}, errors.Wrap(lookupErr, errInstanceLookup)
+				}
+				if guid != "" && !ready {
+					// BTP is still provisioning — requeue without calling Create()
+					return managed.ExternalObservation{}, errors.New("instance found in BTP but still provisioning, requeue")
+				}
+				if guid != "" && ready {
+					// Instance ready — set external-name to GUID and adopt.
+					// Upjet clears stale async conditions on the next successful Observe().
+					meta.SetExternalName(cr, guid)
+					if err := e.kube.Update(ctx, cr); err != nil {
+						return managed.ExternalObservation{}, errors.Wrap(err, errSaveData)
+					}
+					return managed.ExternalObservation{ResourceExists: true, ResourceUpToDate: false}, nil
+				}
+			}
+		}
 		return managed.ExternalObservation{ResourceExists: false}, nil
 	case tfClient.Drift:
 		// ADR(external-name): Calculate and report diff between desired state and what was observed from the API

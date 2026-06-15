@@ -27,6 +27,12 @@ type PlanIdResolver interface {
 	PlanIDByName(ctx context.Context, offeringName string, servicePlanName string) (string, error)
 }
 
+// InstanceLookup resolves a BTP service instance GUID by name in a given subaccount.
+// Implemented by ServiceManagerInstanceProxyClient; the interface exists for testability.
+type InstanceLookup interface {
+	InstanceLookupBySubaccount(ctx context.Context, subaccountId string, instanceName string) (guid string, ready bool, err error)
+}
+
 // NewCredsFromOperatorSecret creates a new BindingCredentials from a secret data
 // of a btp service operator secret, which is slightly different in structure then
 // the creds of a regular servicebinding
@@ -83,6 +89,7 @@ type BindingCredentials struct {
 type ServiceManagerClient struct {
 	servicemanager.ServiceOfferingsAPI
 	servicemanager.ServicePlansAPI
+	servicemanager.ServiceInstancesAPI
 }
 
 func NewServiceManagerClient(ctx context.Context, creds *BindingCredentials) (*ServiceManagerClient, error) {
@@ -116,6 +123,7 @@ func NewServiceManagerClient(ctx context.Context, creds *BindingCredentials) (*S
 	return &ServiceManagerClient{
 		apiClient.ServiceOfferingsAPI,
 		apiClient.ServicePlansAPI,
+		apiClient.ServiceInstancesAPI,
 	}, nil
 }
 
@@ -141,4 +149,24 @@ func (sm *ServiceManagerClient) PlanIDByName(ctx context.Context, offeringName, 
 
 	servicePlanID := *object.Items[0].Id
 	return servicePlanID, nil
+}
+
+// InstanceIDByName queries the SM API for a service instance matching the given name.
+// The SM client is already scoped to the correct subaccount via its credentials.
+// Returns ("", false, nil) when no matching instance is found.
+func (sm *ServiceManagerClient) InstanceIDByName(ctx context.Context, name string) (string, bool, error) {
+	fieldQuery := fmt.Sprintf("name eq '%s'", name)
+	result, _, err := sm.GetAllServiceInstances(ctx).FieldQuery(fieldQuery).Execute()
+	if err != nil {
+		return "", false, err
+	}
+	if len(result.Items) == 0 {
+		return "", false, nil
+	}
+	item := result.Items[0]
+	if item.Id == nil {
+		return "", false, nil
+	}
+	ready := item.Ready != nil && *item.Ready
+	return *item.Id, ready, nil
 }

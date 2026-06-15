@@ -138,8 +138,8 @@ func TestLookup(t *testing.T) {
 			}
 
 			smClient := ServiceManagerInstanceProxyClient{
-				accountService,
-				func(ctx context.Context, credentials *BindingCredentials) (PlanIdResolver, error) {
+				SubaccountOperationsAPI: accountService,
+				smServiceFn: func(ctx context.Context, credentials *BindingCredentials) (PlanIdResolver, error) {
 					return &PlanIdResolverFake{
 						PlanLookupMockFn: tc.args.PlanLookupMockFn,
 					}, nil

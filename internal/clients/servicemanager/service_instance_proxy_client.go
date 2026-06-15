@@ -42,6 +42,32 @@ func (t ServiceManagerInstanceProxyClient) ServiceManagerPlanIDByName(ctx contex
 	return t.dynamicServiceInstance(ctx, subaccountId, t.resolveServicePlan(ctx, servicePlanName))
 }
 
+// InstanceLookupBySubaccount queries the SM API for a service instance by name in the given subaccount.
+// It reuses a persistent admin binding if one exists, otherwise creates a temporary one and deletes it after use.
+// Returns ("", false, nil) when no matching instance is found.
+func (t ServiceManagerInstanceProxyClient) InstanceLookupBySubaccount(ctx context.Context, subaccountId string, instanceName string) (string, bool, error) {
+	binding, err := t.describeAdminBinding(ctx, subaccountId)
+	if err != nil {
+		return "", false, err
+	}
+	temporary := binding == nil
+	if temporary {
+		binding, err = t.createAdminBinding(ctx, subaccountId)
+		if err != nil {
+			return "", false, err
+		}
+	}
+	smClient, err := NewServiceManagerClient(ctx, binding)
+	if err != nil {
+		return "", false, err
+	}
+	guid, ready, err := smClient.InstanceIDByName(ctx, instanceName)
+	if temporary {
+		_ = t.deleteAdminBinding(ctx, subaccountId)
+	}
+	return guid, ready, err
+}
+
 func (t ServiceManagerInstanceProxyClient) dynamicServiceInstance(ctx context.Context, subaccountId string, resolvalFn func(binding *BindingCredentials) (string, error)) (string, error) {
 	binding, err := t.createAdminBinding(ctx, subaccountId)
 	if err != nil {

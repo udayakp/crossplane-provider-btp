@@ -1300,3 +1300,175 @@ func TestSaveInstanceData(t *testing.T) {
 		})
 	}
 }
+
+// ====================================================================================
+// adoptIfExists tests
+// ====================================================================================
+
+type mockInstanceLookup struct {
+	guid  string
+	ready bool
+	err   error
+}
+
+func (m *mockInstanceLookup) InstanceLookupBySubaccount(_ context.Context, _ string, _ string) (string, bool, error) {
+	return m.guid, m.ready, m.err
+}
+
+func withAdoptIfExists(adopt bool) func(*v1alpha1.ServiceInstance) {
+	return func(cr *v1alpha1.ServiceInstance) {
+		cr.Spec.ForProvider.AdoptIfExists = &adopt
+	}
+}
+
+func withSubaccountID(id string) func(*v1alpha1.ServiceInstance) {
+	return func(cr *v1alpha1.ServiceInstance) {
+		cr.Spec.ForProvider.SubaccountID = &id
+	}
+}
+
+func TestObserve_AdoptIfExists(t *testing.T) {
+	const testGUID = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+
+	type fields struct {
+		smProxy *mockInstanceLookup // nil means no SM client wired (smProxy=nil on external)
+	}
+	type args struct {
+		mg *v1alpha1.ServiceInstance
+	}
+	type want struct {
+		o            managed.ExternalObservation
+		err          string // substring that must appear in the error, empty means no error
+		externalName string // expected external-name after Observe(), empty means unchanged
+	}
+
+	cases := map[string]struct {
+		reason string
+		fields fields
+		args   args
+		want   want
+	}{
+		// adoptIfExists=true, SM finds instance ready → set external-name, return ResourceExists:true, UpToDate:false
+		"AdoptIfExists_MatchFound_Ready": {
+			reason: "should set external-name to BTP GUID and return ResourceExists:true when SM finds a ready instance",
+			fields: fields{smProxy: &mockInstanceLookup{guid: testGUID, ready: true}},
+			args: args{
+				mg: expectedServiceInstance(withAdoptIfExists(true), withSubaccountID("sub-001")),
+			},
+			want: want{
+				o:            managed.ExternalObservation{ResourceExists: true, ResourceUpToDate: false},
+				externalName: testGUID,
+			},
+		},
+		// adoptIfExists=true, SM finds instance but not yet ready → return error to requeue, no Create()
+		"AdoptIfExists_MatchFound_NotReady": {
+			reason: "should return error and not set external-name when SM finds instance still provisioning",
+			fields: fields{smProxy: &mockInstanceLookup{guid: testGUID, ready: false}},
+			args: args{
+				mg: expectedServiceInstance(withAdoptIfExists(true), withSubaccountID("sub-001")),
+			},
+			want: want{
+				o:   managed.ExternalObservation{},
+				err: "still provisioning",
+			},
+		},
+		// adoptIfExists=true, SM finds no instance → Create() fires normally
+		"AdoptIfExists_NoMatch": {
+			reason: "should return ResourceExists:false (trigger Create) when SM finds no matching instance",
+			fields: fields{smProxy: &mockInstanceLookup{guid: ""}},
+			args: args{
+				mg: expectedServiceInstance(withAdoptIfExists(true), withSubaccountID("sub-001")),
+			},
+			want: want{
+				o: managed.ExternalObservation{ResourceExists: false},
+			},
+		},
+		// adoptIfExists=true, SM lookup returns error → surface the lookup error
+		"AdoptIfExists_LookupError": {
+			reason: "should return a wrapped SM lookup error when the API call fails",
+			fields: fields{smProxy: &mockInstanceLookup{err: errors.New("SM API unavailable")}},
+			args: args{
+				mg: expectedServiceInstance(withAdoptIfExists(true), withSubaccountID("sub-001")),
+			},
+			want: want{
+				o:   managed.ExternalObservation{},
+				err: errInstanceLookup,
+			},
+		},
+		// adoptIfExists=false (default) → Create() fires normally, SM never called
+		"AdoptIfExists_False": {
+			reason: "should return ResourceExists:false without SM lookup when adoptIfExists is false",
+			fields: fields{smProxy: &mockInstanceLookup{guid: testGUID, ready: true}},
+			args: args{
+				mg: expectedServiceInstance(withAdoptIfExists(false), withSubaccountID("sub-001")),
+			},
+			want: want{
+				o: managed.ExternalObservation{ResourceExists: false},
+			},
+		},
+		// adoptIfExists=true but smProxy is nil (CIS client not initialised) → Create() fires normally
+		"AdoptIfExists_NilProxy": {
+			reason: "should return ResourceExists:false without error when smProxy is nil (CIS client not configured)",
+			fields: fields{smProxy: nil},
+			args: args{
+				mg: expectedServiceInstance(withAdoptIfExists(true), withSubaccountID("sub-001")),
+			},
+			want: want{
+				o: managed.ExternalObservation{ResourceExists: false},
+			},
+		},
+		// adoptIfExists=true, smProxy set, but SubaccountID not resolved yet → Create() fires normally
+		"AdoptIfExists_NilSubaccountID": {
+			reason: "should return ResourceExists:false without error when SubaccountID is nil (reference not yet resolved)",
+			fields: fields{smProxy: &mockInstanceLookup{guid: testGUID, ready: true}},
+			args: args{
+				mg: expectedServiceInstance(withAdoptIfExists(true)),
+			},
+			want: want{
+				o: managed.ExternalObservation{ResourceExists: false},
+			},
+		},
+	}
+
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			e := external{
+				tfClient: &TfProxyMock{status: tfclient.NotExisting},
+				kube: &test.MockClient{
+					MockUpdate: test.NewMockUpdateFn(nil),
+				},
+			}
+			// Only set smProxy when non-nil to avoid a typed-nil interface (which is not nil).
+			if tc.fields.smProxy != nil {
+				e.smProxy = tc.fields.smProxy
+			}
+
+			got, err := e.Observe(context.Background(), tc.args.mg)
+
+			if tc.want.err == "" {
+				if err != nil {
+					t.Errorf("\n%s\nunexpected error: %v", tc.reason, err)
+				}
+			} else {
+				if err == nil || !strings.Contains(err.Error(), tc.want.err) {
+					t.Errorf("\n%s\nwant error containing %q, got: %v", tc.reason, tc.want.err, err)
+				}
+			}
+
+			if diff := cmp.Diff(tc.want.o, got); diff != "" {
+				t.Errorf("\n%s\ne.Observe(...): -want, +got:\n%s\n", tc.reason, diff)
+			}
+
+			if tc.want.externalName != "" {
+				cr := tc.args.mg
+				if diff := cmp.Diff(
+					expectedServiceInstance(withAdoptIfExists(true), withSubaccountID("sub-001"), withExternalName(tc.want.externalName)),
+					cr,
+					cmpopts.IgnoreFields(xpv1.ConditionedStatus{}, "Conditions"),
+				); diff != "" {
+					t.Errorf("\n%s\nexternal-name mismatch (-want, +got):\n%s\n", tc.reason, diff)
+				}
+			}
+		})
+	}
+}
